@@ -48,15 +48,26 @@ log = logging.getLogger("phase3")
 
 
 def run(cmd: list[str], stage: str) -> None:
-    """Run a subprocess command, logging stdout/stderr."""
+    """Run a subprocess command, logging stdout/stderr.
+
+    encoding/errors を明示することで Windows のデフォルト cp932 で
+    Unicode 文字 (pmtiles の進捗バー等) に当たって落ちるのを回避する。
+    """
     log.info("[%s] $ %s", stage, " ".join(cmd))
     t0 = time.time()
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        encoding="utf-8",
+        errors="replace",
+    )
     dt = time.time() - t0
-    if result.stdout.strip():
+    if result.stdout and result.stdout.strip():
         for line in result.stdout.strip().splitlines():
             log.info("[%s] %s", stage, line)
-    if result.stderr.strip():
+    if result.stderr and result.stderr.strip():
         for line in result.stderr.strip().splitlines():
             log.warning("[%s] %s", stage, line)
     if result.returncode != 0:
@@ -133,6 +144,18 @@ def stage5_metadata(
     temp_dir: Path,
 ) -> None:
     """pmtiles edit: inject las2veg-rgb specific metadata."""
+    # phase2_encode.py の QUANTIZE_MAX と同期: 指標ごとの上限値で正規化
+    # 復号式: real_value = (encoded_4bit / 15) * quantize_max
+    # canopy_height_p95 の 0.6 は Phase 1 正規化 (0-100m) のうち 0-60m を量子化、
+    # 即ち bin 0..15 は 0..60m を表す (1段階 4m、世界 99.5% カバー)。
+    quantize_max = {
+        "density_z1":        1.0,
+        "density_z2":        1.0,
+        "density_z3":        1.0,
+        "occupancy_z1":      0.5,
+        "occupancy_z2":      0.5,
+        "canopy_height_p95": 0.6,
+    }
     metadata = {
         "name": "las2veg-rgb",
         "version": "0.1.0",
@@ -146,8 +169,11 @@ def stage5_metadata(
             "B_low4":  "occupancy_z1",
             "A":       "unused (always 255)",
         },
-        "scaling": "linear_16_steps",
-        "decode_formula": "value = encoded_4bit / 15",
+        "scaling": "uniform_16_bins_per_indicator",
+        "bin_definition": "Bin N covers [N/16, (N+1)/16) * quantize_max",
+        "decode_formula_center": "real_value = (encoded_4bit + 0.5) / 16 * quantize_max[name]",
+        "decode_formula_lower":  "real_value =  encoded_4bit       / 16 * quantize_max[name]",
+        "quantize_max": quantize_max,
         "canopy_height_p95_unit_meters": CANOPY_UPPER_BOUND_M,
         "z3_upper_bound_m": CANOPY_UPPER_BOUND_M,
         "spec_url": "https://github.com/Trilor/las2veg-rgb/blob/main/docs/spec.md",
@@ -256,16 +282,17 @@ def verify_one_tile(
 @click.option(
     "--input",
     "input_path",
-    default="data/output/encoded_rgba.tif",
+    default=None,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help="Phase 2 output RGBA GeoTIFF (EPSG:6676).",
+    help="Phase 2 output RGBA GeoTIFF (EPSG:6676). "
+         "Defaults to data/output/latest/encoded_rgba.tif.",
 )
 @click.option(
     "--output",
     "output_path",
-    default="data/output/output.pmtiles",
+    default=None,
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Final PMTiles file.",
+    help="Final PMTiles file. Defaults to <input-dir>/output.pmtiles.",
 )
 @click.option(
     "--overview-levels",
@@ -283,13 +310,34 @@ def verify_one_tile(
     help="Extract one tile from the PMTiles and report pixel value range.",
 )
 def main(
-    input_path: Path,
-    output_path: Path,
+    input_path: Path | None,
+    output_path: Path | None,
     overview_levels: str,
     clean: bool,
     verify: bool,
 ) -> None:
     """Build a PMTiles file from a Phase 2 RGBA GeoTIFF."""
+    if input_path is None:
+        from las2veg_rgb.runs import find_latest_run
+
+        latest = find_latest_run(Path("data/output"))
+        if latest is None:
+            raise click.ClickException(
+                "No run directory found under data/output/. "
+                "Run phase1_preview.py and phase2_encode.py first or pass --input."
+            )
+        input_path = latest / "encoded_rgba.tif"
+        if not input_path.exists():
+            raise click.ClickException(
+                f"Expected {input_path} but it does not exist. "
+                "Run phase2_encode.py first."
+            )
+        log.info("Auto-detected input from latest run: %s", input_path)
+
+    if output_path is None:
+        output_path = input_path.parent / "output.pmtiles"
+        log.info("Auto-detected output path: %s", output_path)
+
     out_dir = output_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     reprojected = out_dir / "encoded_rgba_3857.tif"

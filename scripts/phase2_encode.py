@@ -22,12 +22,15 @@ Run:
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 
 import click
 import numpy as np
 import rasterio
 from rasterio.enums import ColorInterp
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,14 +54,35 @@ PACKING: tuple[tuple[str, str], ...] = (
     ("density_z1", "occupancy_z1"),       # B
 )
 
+# 指標ごとの量子化スケール (= 「16段階で何の値域までを表現するか」)
+# - occupancy: 実データが 0-0.4 程度に集中 → 0.5 で量子化 (1段階 0.033)
+# - canopy_height_p95: Phase 1 では 0-1 (=0-100m) で正規化、Phase 2 で実用域を
+#   0-0.6 (=0-60m) として量子化 (1段階 4m、世界 99.5% カバー、ユーカリ巨木の一部のみ clip)
+# - density: フルレンジ 0-1.0 (1段階 0.067)
+# >>> ブラウザ側のデコードもこれに合わせる: value = (encoded / 15) * MAX_VALUE
+QUANTIZE_MAX: dict[str, float] = {
+    "density_z1":        1.0,
+    "density_z2":        1.0,
+    "density_z3":        1.0,
+    "occupancy_z1":      0.5,
+    "occupancy_z2":      0.5,
+    "canopy_height_p95": 0.6,
+}
 
-def quantize_to_4bit(values: np.ndarray) -> np.ndarray:
-    """Map float [0, 1] to uint8 [0, 15] via linear 16-step quantization.
 
-    Values outside [0, 1] are clipped. NaN becomes 0.
+def quantize_to_4bit(values: np.ndarray, max_value: float = 1.0) -> np.ndarray:
+    """Map float [0, max_value] to uint8 [0, 15] via uniform-width 16-bin quantization.
+
+    Each bin N covers the half-open range [N/16, (N+1)/16) * max_value.
+    Bin 15 also captures the closed endpoint (value == max_value).
+    Values outside [0, max_value] are clipped. NaN becomes 0.
+
+    Decode side should use: value = (encoded + 0.5) / 16 * max_value  (bin center)
+                       or: value =  encoded       / 16 * max_value  (bin lower bound)
     """
-    clipped = np.clip(np.nan_to_num(values, nan=0.0), 0.0, 1.0)
-    return np.round(clipped * 15.0).astype(np.uint8)
+    clipped = np.clip(np.nan_to_num(values, nan=0.0), 0.0, max_value)
+    scaled = clipped / max_value * 16.0
+    return np.minimum(np.floor(scaled), 15.0).astype(np.uint8)
 
 
 def pack_4bit_pair(high4: np.ndarray, low4: np.ndarray) -> np.ndarray:
@@ -121,11 +145,18 @@ def write_rgba(out_path: Path, rgba: np.ndarray, profile: dict) -> None:
 
 
 def encode(indicators: dict[str, np.ndarray]) -> np.ndarray:
-    """Build a (4, H, W) uint8 RGBA array from indicator dict."""
+    """Build a (4, H, W) uint8 RGBA array from indicator dict.
+
+    Each indicator is quantized with its own QUANTIZE_MAX (most are 1.0,
+    occupancy_z1/z2 use 0.5 to better fit observed data distribution).
+    """
     height, width = indicators["density_z1"].shape
     rgba = np.zeros((4, height, width), dtype=np.uint8)
 
-    quantized = {name: quantize_to_4bit(arr) for name, arr in indicators.items()}
+    quantized = {
+        name: quantize_to_4bit(arr, QUANTIZE_MAX[name])
+        for name, arr in indicators.items()
+    }
 
     for ch_idx, (high_name, low_name) in enumerate(PACKING):
         rgba[ch_idx] = pack_4bit_pair(quantized[high_name], quantized[low_name])
@@ -137,19 +168,30 @@ def encode(indicators: dict[str, np.ndarray]) -> np.ndarray:
 def verify_roundtrip(
     indicators: dict[str, np.ndarray], rgba: np.ndarray
 ) -> dict[str, dict[str, float]]:
-    """Decode the RGBA back to ratios and report per-indicator round-trip stats."""
+    """Decode the RGBA back to ratios and report per-indicator round-trip stats.
+
+    Decoding uses bin center: value = (encoded + 0.5) / 16 * quantize_max.
+    Each bin N covers [N/16, (N+1)/16) * quantize_max, so the center is
+    the unbiased reconstruction.
+    """
     decoded: dict[str, np.ndarray] = {}
     for ch_idx, (high_name, low_name) in enumerate(PACKING):
         high4, low4 = unpack_4bit_pair(rgba[ch_idx])
-        decoded[high_name] = high4.astype(np.float32) / 15.0
-        decoded[low_name] = low4.astype(np.float32) / 15.0
+        decoded[high_name] = (high4.astype(np.float32) + 0.5) / 16.0 * QUANTIZE_MAX[high_name]
+        decoded[low_name]  = (low4.astype(np.float32) + 0.5) / 16.0 * QUANTIZE_MAX[low_name]
 
     stats: dict[str, dict[str, float]] = {}
     for name in INDICATOR_BANDS:
-        original = indicators[name]
+        # クリップ範囲外の値は復元誤差として大きく出るので、フェアな比較のため
+        # 元値も QUANTIZE_MAX で clip してから差を取る
+        original_clipped = np.clip(indicators[name], 0.0, QUANTIZE_MAX[name])
         recovered = decoded[name]
-        diff = np.abs(original - recovered)
+        diff = np.abs(original_clipped - recovered)
+        # 半 bin 幅 = (1/16)/2 = 1/32 が理論最大誤差 (bin 中央復号 + 端を除く)
+        max_step_error = QUANTIZE_MAX[name] / 32.0
         stats[name] = {
+            "quantize_max": QUANTIZE_MAX[name],
+            "expected_max_error": max_step_error,
             "max_abs_error": float(diff.max()),
             "mean_abs_error": float(diff.mean()),
             "p95_abs_error": float(np.percentile(diff, 95)),
@@ -161,29 +203,59 @@ def verify_roundtrip(
 @click.option(
     "--input",
     "input_path",
-    required=True,
+    default=None,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help="Input multi-band float32 GeoTIFF from Phase 1.",
+    help="Input multi-band float32 GeoTIFF from Phase 1. "
+         "Defaults to data/output/latest/preview_indicators.tif.",
 )
 @click.option(
     "--output",
     "output_path",
-    required=True,
+    default=None,
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Output 4-band uint8 RGBA GeoTIFF.",
+    help="Output 4-band uint8 RGBA GeoTIFF. "
+         "Defaults to <input-dir>/encoded_rgba.tif.",
 )
 @click.option(
     "--verify",
     is_flag=True,
     help="After encoding, decode the result and report round-trip errors.",
 )
-def main(input_path: Path, output_path: Path, verify: bool) -> None:
+def main(input_path: Path | None, output_path: Path | None, verify: bool) -> None:
     """Phase 2: pack 6 ratio indicators into a 4-bit RGBA GeoTIFF."""
+    # Resolve defaults from Phase 1 run directory
+    if input_path is None:
+        # Lazy import to avoid hard dependency on src/ path
+        sys.path.insert(0, str(REPO_ROOT / "src"))
+        from las2veg_rgb.runs import find_latest_run  # noqa: E402
+
+        latest = find_latest_run(Path("data/output"))
+        if latest is None:
+            raise click.ClickException(
+                "No run directory found under data/output/. "
+                "Run phase1_preview.py first or pass --input explicitly."
+            )
+        input_path = latest / "preview_indicators.tif"
+        if not input_path.exists():
+            raise click.ClickException(
+                f"Expected {input_path} but it does not exist. "
+                "Run phase1_preview.py first."
+            )
+        log.info("Auto-detected input from latest run: %s", input_path)
+
+    if output_path is None:
+        output_path = input_path.parent / "encoded_rgba.tif"
+        log.info("Auto-detected output path: %s", output_path)
+
     log.info("Reading indicators from %s", input_path)
     indicators, profile = read_indicators(input_path)
     log.info("Loaded shape=%s (H, W)", indicators["density_z1"].shape)
 
     log.info("Quantizing to 16 steps and packing into RGBA...")
+    log.info("  per-indicator quantize_max:")
+    for name in INDICATOR_BANDS:
+        log.info("    %-20s -> max %.2f (1 step = %.4f)",
+                 name, QUANTIZE_MAX[name], QUANTIZE_MAX[name] / 15.0)
     rgba = encode(indicators)
 
     log.info("Writing RGBA GeoTIFF to %s", output_path)
@@ -193,11 +265,13 @@ def main(input_path: Path, output_path: Path, verify: bool) -> None:
     if verify:
         log.info("Verifying round-trip (encode -> decode -> compare)...")
         stats = verify_roundtrip(indicators, rgba)
-        log.info("Round-trip error stats (expected: max_abs <= 1/30 ≈ 0.034):")
+        log.info("Round-trip error stats (expected: max_abs <= quantize_max/30):")
         for name, st in stats.items():
             log.info(
-                "  %-18s max=%.4f  mean=%.4f  p95=%.4f",
+                "  %-18s qmax=%.2f exp<=%.4f  max=%.4f  mean=%.4f  p95=%.4f",
                 name,
+                st["quantize_max"],
+                st["expected_max_error"],
                 st["max_abs_error"],
                 st["mean_abs_error"],
                 st["p95_abs_error"],
