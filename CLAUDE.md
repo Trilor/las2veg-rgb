@@ -111,7 +111,29 @@ PY="/c/Users/kurag/AppData/Local/anaconda3/envs/las2veg/python.exe"
 - `data/` 配下や生成物は staging しない (`.gitignore` 任せ)。
   `git add -A` は使わずファイルを明示する。
 
-## 6. このファイルの更新ルール
+## 6. odrop との連携
+
+las2veg-rgb は PMTiles を吐くだけ、odrop はそれを `veg2isom://` プロトコルでデコードして表示する。
+両者は **PMTiles ファイル経由でのみ繋がる**。コード上の依存は無い。
+
+### 開発フローで連携する場合
+
+1. las2veg-rgb で Phase 1→2→3 を実行し `data/output/run_xxx/vegetation.pmtiles` を生成
+2. 生成物を `../odrop/public/veg/<name>.pmtiles` にコピー (odrop 開発時のみ)
+3. odrop dev server を起動して、対象 PMTiles の URL を指定してブラウザ確認
+
+ブラウザでの表示確認は人間しかできない。エージェントは PMTiles 生成 + コピー + dev server
+起動までで止まり、視覚的検証はユーザに依頼する。
+
+### エンコード/デコード式の変更時
+
+Phase 2 の bit packing と odrop 側 `src/core/protocols/veg2isom.ts` のデコード式は
+**ペアで動く**。片方だけ変えると壊れる。変更時は両 repo を同時に編集する必要があり、
+VSCode のワークスペースに両方が見える状態 (multi-root か `GitHub/` ルート開き) で作業する。
+
+odrop 側の関連事実: [odrop/CLAUDE.md](../odrop/CLAUDE.md) を参照。
+
+## 7. このファイルの更新ルール
 
 以下に該当する事実が発生したら **その場で追記** する (別途確認不要):
 
