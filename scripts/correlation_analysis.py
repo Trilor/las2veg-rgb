@@ -105,6 +105,10 @@ def main(input_path: Path | None, output_dir: Path | None) -> None:
         o1 = src.read(BAND_INDEX["occupancy_z1"]).astype(np.float64).ravel()
         o2 = src.read(BAND_INDEX["occupancy_z2"]).astype(np.float64).ravel()
 
+    # NaN セル (データなし) を除外して同じインデックスで揃える
+    valid = ~(np.isnan(d1) | np.isnan(d2) | np.isnan(o1) | np.isnan(o2))
+    d1, d2, o1, o2 = d1[valid], d2[valid], o1[valid], o2[valid]
+
     csv_path = output_dir / "correlation.csv"
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 

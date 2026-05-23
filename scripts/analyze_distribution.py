@@ -49,9 +49,11 @@ def histogram_per_indicator(arr: np.ndarray, bins: np.ndarray) -> tuple[np.ndarr
     Returns (counts, zero_count, nonzero_count).
     counts is the histogram across nonzero cells only (so the zero spike
     doesn't drown out the rest of the distribution).
+    NaN セル (= データなし) は集計から除外。
     """
-    zero_count = int((arr == 0).sum())
-    nonzero = arr[arr > 0]
+    valid = arr[~np.isnan(arr)]
+    zero_count = int((valid == 0).sum())
+    nonzero = valid[valid > 0]
     counts, _ = np.histogram(nonzero, bins=bins)
     return counts, zero_count, nonzero.size
 
@@ -135,7 +137,9 @@ def main(input_path: Path | None, output_dir: Path | None) -> None:
 
         for idx, name in enumerate(INDICATOR_NAMES):
             arr = bands[name]
-            total_cells = arr.size
+            # NaN セル (データなし) は除外して total_cells を計算
+            valid = arr[~np.isnan(arr)]
+            total_cells = valid.size
             counts, zero_count, nonzero_count = histogram_per_indicator(arr, bins)
             pct = (counts / nonzero_count * 100.0) if nonzero_count > 0 else np.zeros_like(counts, dtype=float)
 

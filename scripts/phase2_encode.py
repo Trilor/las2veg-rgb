@@ -149,10 +149,15 @@ def encode(indicators: dict[str, np.ndarray]) -> np.ndarray:
 
     Each indicator is quantized with its own QUANTIZE_MAX (most are 1.0,
     occupancy_z1/z2 use 0.5 to better fit observed data distribution).
+
+    Alpha channel = 0 where any indicator is NaN (= no LiDAR data),
+    255 elsewhere. ブラウザは A=0 のピクセルを透明として描画。
     """
     height, width = indicators["density_z1"].shape
     rgba = np.zeros((4, height, width), dtype=np.uint8)
 
+    # quantize_to_4bit が NaN を 0 に変換するので、データなし箇所は
+    # encoded 値が全て 0 になるが、Alpha=0 で透明として明示する
     quantized = {
         name: quantize_to_4bit(arr, QUANTIZE_MAX[name])
         for name, arr in indicators.items()
@@ -161,7 +166,11 @@ def encode(indicators: dict[str, np.ndarray]) -> np.ndarray:
     for ch_idx, (high_name, low_name) in enumerate(PACKING):
         rgba[ch_idx] = pack_4bit_pair(quantized[high_name], quantized[low_name])
 
-    rgba[3] = 255  # A channel unused
+    # データなしマスクを作成: いずれかの指標が NaN ならデータなし
+    nodata = np.zeros((height, width), dtype=bool)
+    for arr in indicators.values():
+        nodata |= np.isnan(arr)
+    rgba[3] = np.where(nodata, 0, 255).astype(np.uint8)
     return rgba
 
 
@@ -182,10 +191,20 @@ def verify_roundtrip(
 
     stats: dict[str, dict[str, float]] = {}
     for name in INDICATOR_BANDS:
+        # NaN (データなし) セルは round-trip 検証から除外
+        original = indicators[name]
+        valid = ~np.isnan(original)
+        if not valid.any():
+            stats[name] = {
+                "quantize_max": QUANTIZE_MAX[name],
+                "expected_max_error": QUANTIZE_MAX[name] / 32.0,
+                "max_abs_error": 0.0, "mean_abs_error": 0.0, "p95_abs_error": 0.0,
+            }
+            continue
         # クリップ範囲外の値は復元誤差として大きく出るので、フェアな比較のため
         # 元値も QUANTIZE_MAX で clip してから差を取る
-        original_clipped = np.clip(indicators[name], 0.0, QUANTIZE_MAX[name])
-        recovered = decoded[name]
+        original_clipped = np.clip(original[valid], 0.0, QUANTIZE_MAX[name])
+        recovered = decoded[name][valid]
         diff = np.abs(original_clipped - recovered)
         # 半 bin 幅 = (1/16)/2 = 1/32 が理論最大誤差 (bin 中央復号 + 端を除く)
         max_step_error = QUANTIZE_MAX[name] / 32.0

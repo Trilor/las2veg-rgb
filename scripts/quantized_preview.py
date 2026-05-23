@@ -59,20 +59,29 @@ def make_16color_cmap() -> ListedColormap:
 
     Matplotlib の tab20 は 20 色なので 16 色だけ取り出す。
     隣接ビンが明確に違う色になるよう、tab20 の前 16 を採用 (色相が交互配置)。
+    set_bad で NaN セルを透明 (RGBA = (0,0,0,0)) として描画する。
     """
     base = plt.get_cmap("tab20")
     colors = [base(i / 19) for i in range(16)]  # 0..15 で 16 色を取り出す
-    return ListedColormap(colors, name="quantized16")
+    cmap = ListedColormap(colors, name="quantized16")
+    cmap.set_bad((0, 0, 0, 0))  # NaN/masked → 透明
+    return cmap
 
 
 def quantize_to_bins(values: np.ndarray, max_value: float) -> np.ndarray:
     """0..max_value の値を 0..15 のビン番号に量子化 (Phase 2 と同じ式)。
 
     Bin N は [N/16, (N+1)/16) * max_value の範囲を表す均等幅区間。
+    NaN 入力は出力でも NaN (float) として残す → masked array で透明描画。
     """
+    nan_mask = np.isnan(values)
     clipped = np.clip(np.nan_to_num(values, nan=0.0), 0.0, max_value)
     scaled = clipped / max_value * 16.0
-    return np.minimum(np.floor(scaled), 15.0).astype(np.uint8)
+    bins = np.minimum(np.floor(scaled), 15.0)
+    # NaN 入力箇所は NaN にして masked array で扱えるようにする
+    bins_f = bins.astype(np.float32)
+    bins_f[nan_mask] = np.nan
+    return bins_f
 
 
 def save_quantized_png(
@@ -80,34 +89,50 @@ def save_quantized_png(
     bin_values: np.ndarray,
     title: str,
     cmap: ListedColormap,
+    dpi: int = 300,
 ) -> None:
-    """量子化済み (0-15) 配列を 16 色離散カラーマップで PNG 出力。"""
-    fig, ax = plt.subplots(figsize=(8, 8), dpi=100)
-    bounds = np.arange(-0.5, 16.5, 1.0)  # bin 中央 = 0,1,...,15
+    """量子化済み (0-15) 配列を 16 色離散カラーマップで PNG 出力。
+
+    BoundaryNorm の境界は量子化方式に合わせて [0, 1, 2, ..., 16] とする:
+      整数値 N (0 <= N < 16) を [N, N+1) の区間として色 N に対応させる。
+      (= 連続値 [N/16, (N+1)/16) * qmax と一貫した解釈)
+    """
+    fig, ax = plt.subplots(figsize=(8, 8), dpi=dpi)
+    bounds = np.arange(0, 17, 1.0)  # [0, 1, 2, ..., 16]
     norm = BoundaryNorm(bounds, cmap.N)
-    im = ax.imshow(bin_values, cmap=cmap, norm=norm, interpolation="nearest")
+    # NaN を masked array で扱い、set_bad で透明描画させる
+    masked = np.ma.masked_invalid(bin_values)
+    im = ax.imshow(masked, cmap=cmap, norm=norm, interpolation="nearest")
     ax.set_title(title)
     ax.set_xlabel("X (grid cells)")
     ax.set_ylabel("Y (grid cells)")
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, ticks=np.arange(16))
-    cbar.set_label("bin (0-15)")
+    # カラーバーのティックは境界 (0, 1, ..., 16) に配置
+    # 各色 N は [N, N+1) の区間を表す
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, ticks=np.arange(17))
+    cbar.set_ticklabels([str(i) for i in range(17)])
+    cbar.set_label("bin boundary (each color N covers [N, N+1))")
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
 
 
-def save_legend(out_path: Path, cmap: ListedColormap) -> None:
-    """16 色 + 凡例 (bin 番号 + 各 QUANTIZE_MAX に対する実値) を 1 枚の PNG に。"""
-    fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
-    # 16 個のカラースウォッチを横一列に
+def save_legend(out_path: Path, cmap: ListedColormap, dpi: int = 300) -> None:
+    """16 色 + 凡例 (bin 境界 + 各 QUANTIZE_MAX に対する実値) を 1 枚の PNG に。
+
+    境界 0, 1, 2, ..., 16 を x 軸の左端から右端に配置し、
+    各色 N は [N, N+1) の区間 (= bin N) を占める。
+    """
+    fig, ax = plt.subplots(figsize=(10, 5), dpi=dpi)
+    # 各色を [N, N+1) の区間で表示するため、imshow の extent で X 軸を [0, 16] に設定
     swatch = np.arange(16).reshape(1, 16)
-    bounds = np.arange(-0.5, 16.5, 1.0)
+    bounds = np.arange(0, 17, 1.0)  # [0, 1, 2, ..., 16]
     norm = BoundaryNorm(bounds, cmap.N)
-    ax.imshow(swatch, cmap=cmap, norm=norm, aspect="auto")
+    ax.imshow(swatch, cmap=cmap, norm=norm, aspect="auto", extent=[0, 16, 0, 1])
     ax.set_yticks([])
-    ax.set_xticks(np.arange(16))
-    ax.set_xticklabels([str(i) for i in range(16)])
-    ax.set_xlabel("bin number")
+    # ティックは境界 (0, 1, ..., 16) に配置
+    ax.set_xticks(np.arange(17))
+    ax.set_xticklabels([str(i) for i in range(17)])
+    ax.set_xlabel("bin boundary (each color N covers [N, N+1))")
     ax.set_title("16-step discrete colormap (shared across all indicators)")
 
     # 各 QUANTIZE_MAX に対応する bin の値域 (下限, 上限) を表に追記
@@ -138,7 +163,13 @@ def save_legend(out_path: Path, cmap: ListedColormap) -> None:
     type=click.Path(file_okay=False, path_type=Path),
     help="Output directory (defaults to <input-dir>/quantized/).",
 )
-def main(input_path: Path | None, output_dir: Path | None) -> None:
+@click.option(
+    "--dpi",
+    default=300,
+    type=int,
+    help="Output image DPI (default: 300). Higher = larger file, sharper grid cells.",
+)
+def main(input_path: Path | None, output_dir: Path | None, dpi: int) -> None:
     if input_path is None:
         from las2veg_rgb.runs import find_latest_run
 
@@ -168,15 +199,18 @@ def main(input_path: Path | None, output_dir: Path | None) -> None:
 
             out_path = output_dir / f"{name}.png"
             title = f"{name}  (QUANTIZE_MAX={qmax}, bins 0-15)"
-            save_quantized_png(out_path, bin_values, title, cmap)
+            save_quantized_png(out_path, bin_values, title, cmap, dpi=dpi)
+            # NaN を除いた有効 bin の一覧
+            valid_bins = bin_values[~np.isnan(bin_values)].astype(np.uint8)
+            unique_bins = sorted(np.unique(valid_bins).tolist())
             log.info(
-                "  [%s] saved %s  (used bins: %s)",
-                name, out_path.name,
-                sorted(np.unique(bin_values).tolist()),
+                "  [%s] saved %s  (used bins: %s, nodata cells: %d)",
+                name, out_path.name, unique_bins,
+                int(np.isnan(bin_values).sum()),
             )
 
     legend_path = output_dir / "legend.png"
-    save_legend(legend_path, cmap)
+    save_legend(legend_path, cmap, dpi=dpi)
     log.info("  legend: %s", legend_path)
 
     log.info("Done.")

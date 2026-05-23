@@ -433,6 +433,7 @@ def write_geotiff_indicators(
         "canopy_height_p95",
     ]
     transform = from_origin(gx_min, gy_max, mesh_size_m, mesh_size_m)
+    # NoData は NaN で表現する (float32 でネイティブサポート、ツール互換性も良い)
     with rasterio.open(
         out_path,
         "w",
@@ -444,7 +445,7 @@ def write_geotiff_indicators(
         crs=crs,
         transform=transform,
         compress="deflate",
-        nodata=-1,
+        nodata=np.nan,
     ) as dst:
         for i, name in enumerate(band_order, start=1):
             dst.write(indicators[name].astype(np.float32), i)
@@ -452,9 +453,12 @@ def write_geotiff_indicators(
 
 
 def save_png(out_path: Path, arr: np.ndarray, title: str, cmap: str) -> None:
-    """Render a [0, 1] float array as a quick-look PNG."""
+    """Render a [0, 1] float array as a quick-look PNG. NaN セルは透明。"""
     fig, ax = plt.subplots(figsize=(8, 8), dpi=100)
-    im = ax.imshow(arr, cmap=cmap, interpolation="nearest", vmin=0.0, vmax=1.0)
+    cmap_obj = plt.get_cmap(cmap).copy()
+    cmap_obj.set_bad((0, 0, 0, 0))
+    masked = np.ma.masked_invalid(arr)
+    im = ax.imshow(masked, cmap=cmap_obj, interpolation="nearest", vmin=0.0, vmax=1.0)
     ax.set_title(title)
     ax.set_xlabel("X (grid cells)")
     ax.set_ylabel("Y (grid cells)")
@@ -591,6 +595,14 @@ def main(
     log.info("Computing ratio indicators...")
     z0, z1, z2, z3 = counts["z0"], counts["z1"], counts["z2"], counts["z3"]
     total = z0 + z1 + z2 + z3
+    # データなしマスク: total == 0 のセル = LiDAR 点が 1 つもない
+    data_mask = total > 0  # bool (ny, nx)、True = 有効データ
+    n_nodata = int((~data_mask).sum())
+    log.info(
+        "  data mask: %d cells with data, %d nodata cells (%.1f%%)",
+        int(data_mask.sum()), n_nodata, n_nodata / data_mask.size * 100,
+    )
+
     indicators: dict[str, np.ndarray] = {
         "density_z1": safe_ratio(z1, z0 + z1),
         "density_z2": safe_ratio(z2, z0 + z1 + z2),
@@ -612,6 +624,15 @@ def main(
         z3_x, z3_y, z3_h, gx_min, gy_min, nx, ny, mesh_size_m,
     )
     del z3_x, z3_y, z3_h
+
+    # データなしセルを NaN に変換 (GeoTIFF の nodata と一致)
+    # これにより下流の Phase 2 / quantized_preview / 各種分析で
+    # 「真のゼロ」と「データなし」を区別できる
+    log.info("Applying data mask: setting %d nodata cells to NaN", n_nodata)
+    for name, arr in indicators.items():
+        arr_f32 = arr.astype(np.float32)
+        arr_f32[~data_mask] = np.nan
+        indicators[name] = arr_f32
 
     log.info("Writing PNG previews...")
     cmap_for: dict[str, str] = {
