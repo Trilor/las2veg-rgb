@@ -107,7 +107,7 @@ PY="/c/Users/kurag/AppData/Local/anaconda3/envs/las2veg/python.exe"
   ```
   Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
   ```
-- push はユーザの明示指示があるまでしない。
+- **push は「プッシュして」と明示指示があるまで絶対にしない**。`git push` を勝手に実行しない。
 - `data/` 配下や生成物は staging しない (`.gitignore` 任せ)。
   `git add -A` は使わずファイルを明示する。
 
