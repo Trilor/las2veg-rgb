@@ -27,14 +27,16 @@ LAS/LAZ 点群を、植生・テレイン解析向けマルチバンド RGBA PMT
 | z0 | 0.00 - 0.25 | Ground | ―（常に1.0で意味なし） | ― |
 | z1 | 0.25 - 1.00 | Low Bush | あり | あり |
 | z2 | 1.00 - 2.00 | High Bush | あり | あり |
-| z3 | 2.00 - 100.00 | Canopy | あり | ―（サブボクセル数が多すぎる） |
+| z3 | 2.00 - canopy_height_p95 | Canopy | あり | あり（セル単位で上端可変） |
+
+z3 の occupancy は当初「サブボクセル数が多すぎて計算しない」としていたが、セルごとに上端を canopy_height_p95 まで切り詰めれば現実的なサイズで計算できる。サブボクセル分母もセル単位で可変 (`4*4*ceil((p95-2.0)/0.25)`)。canopy_height_p95 < 2.0m のセル (= キャノピー無し) は occupancy_z3 = 0.0 とする。
 
 z3 の上限を 100m にする理由:
 - 世界中の森林（最高樹高はカリフォルニアのハイペリオン 115m）を網羅
 - PDAL HAG の異常値（200m+）を自動除外
 - 全タイルで統一基準にしてタイル間整合を保つ
 
-## 3. 6 指標の定義（比率ベース）
+## 3. 7 指標の定義（比率ベース）
 
 全て [0.0, 1.0] の比率値。レーザー密度に非依存。
 
@@ -45,7 +47,8 @@ z3 の上限を 100m にする理由:
 | 3 | `density_z3` | `z3 / (z0 + z1 + z2 + z3)` | 全パルスのうち z3 で止まった割合 (キャノピー遮蔽率) |
 | 4 | `occupancy_z1` | (1点以上ある 25cm³ サブボクセル数) / 48 | Low Bush の空間広がり |
 | 5 | `occupancy_z2` | (1点以上ある 25cm³ サブボクセル数) / 64 | High Bush の空間広がり |
-| 6 | `canopy_height_p95` | z3 内点群の高さ 95 パーセンタイル / 100m | 樹冠高指標 (NASA GEDI 互換、林学・生態学・防災で標準) |
+| 6 | `occupancy_z3` | (1点以上ある 25cm³ サブボクセル数) / `16 * ceil((p95-2.0)/0.25)` | Canopy 内部の空間充填率 (セル単位で上端=p95 まで切る; p95 < 2.0m は 0.0) |
+| 7 | `canopy_height_p95` | z3 内点群の高さ 95 パーセンタイル / 100m | 樹冠高指標 (NASA GEDI 互換、林学・生態学・防災で標準) |
 
 **式の物理的解釈**: `density_zN = zN / (zN まで届いたパルス数)`。レーザーは上から下に降ってくるので、ある層に届いたパルス数 = その層より下に到達した点の総数 (= zN 自身 + それ以下の層の合計)。
 
@@ -57,6 +60,8 @@ z3 の上限を 100m にする理由:
 - 1m グリッド 1 セルあたり: 4 × 4 × Nz サブボクセル
   - z1: 4 × 4 × 3 = 48
   - z2: 4 × 4 × 4 = 64
+  - z3: 4 × 4 × `ceil((p95-2.0)/0.25)` (セル単位で可変、p95 < 2.0m は 0)
+- メッシュサイズが N×N m の場合は xy 方向に `(4N) × (4N)` サブボクセル
 - occupancy = (1点以上を含むボクセル数) / (総ボクセル数)
 
 ## 5. 空間整合性
@@ -211,7 +216,8 @@ WebP Lossless 採用も検討したが、GDAL の MBTiles ドライバが WebP L
 | ファイル | 内容 |
 |---|---|
 | `preview_density_z1.png`, `preview_density_z2.png`, `preview_density_z3.png` | density 指標のクイックビュー (viridis colormap, 0.0-1.0) |
-| `preview_occupancy_z1.png`, `preview_occupancy_z2.png` | occupancy 指標のクイックビュー (magma colormap, 0.0-1.0) |
-| `preview_indicators.tif` | 5バンド float32 GeoTIFF (CRS 付き)。バンド順: density_z1, density_z2, density_z3, occupancy_z1, occupancy_z2 |
+| `preview_occupancy_z1.png`, `preview_occupancy_z2.png`, `preview_occupancy_z3.png` | occupancy 指標のクイックビュー (magma colormap, 0.0-1.0) |
+| `preview_canopy_height_p95.png` | canopy_height_p95 のクイックビュー (cividis, 0.0-1.0 = 0-100m) |
+| `preview_indicators.tif` | 7バンド float32 GeoTIFF (CRS 付き)。バンド順: density_z1, density_z2, density_z3, occupancy_z1, occupancy_z2, occupancy_z3, canopy_height_p95 |
 | `preview_meta.json` | bbox / CRS / 各層の点数 / 各指標の統計 (min/max/mean/nonzero percentiles) |
 | `<入力名>_hag.laz` | PDAL 処理済みの中間 LAZ (入力と同じディレクトリにキャッシュ) |
