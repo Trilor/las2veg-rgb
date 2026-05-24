@@ -35,15 +35,49 @@ C:\Users\kurag\AppData\Local\anaconda3\envs\las2veg\python.exe
 conda env 一覧は `C:\Users\kurag\.conda\environments.txt` に記録されている。
 `conda` コマンドが PATH 上に無いため、env の python.exe を絶対パスで直接呼ぶのが確実。
 
-### Bash 経由で実行するときの落とし穴
+### Python を呼ぶときの最重要事項: PATH に env の `Library/bin` を必ず前置すること
 
-**matplotlib が描画前にハードクラッシュ (exit 127) する。**
+**原因 (2026-05-24 確定)**: las2veg env の python.exe を絶対パスで叩くだけでは不十分。
+PATH に `<env_root>\Library\bin` が無いと、Windows が `freetype.dll`, `libpng.dll`,
+`zlib.dll` などを **別アプリ (Inkscape, gfortran, QGIS, mingw 等)** から拾ってロードし、
+ABI 不一致で matplotlib の C 拡張 (`canvas.draw()` / `savefig()` の中身) が SEGV する。
 
-Git Bash から las2veg env の Python を起動して `plt.subplots()` を呼ぶと、デフォルト
-GUI backend (Tk/Qt) の DLL 解決に失敗してプロセスが落ちる。エラーメッセージも出ず
-シェルが exit 127 を返すだけなので、原因の特定が難しい。
+クラッシュは `plt.subplots()` ではなく **`canvas.draw()` または `savefig()` で発生**する。
+そのため「PNG 出力の直前まで動いて死ぬ」「以前は exit 127、今は exit 0 だが run dir が空」
+のような症状になる。tee の buffering とは無関係。
 
-**対策**: 描画を行うスクリプトには必ず以下を入れる。
+**過去の誤認 (反省記録)**:
+- 「`matplotlib.use("Agg")` を入れれば直る」→ 不十分。PATH が正しくないと Agg でも落ちる。
+- 「PowerShell では再現しない」→ 誤り。前回動いたのは `conda activate las2veg` 相当の
+  PATH 前置を手動でしていたから。素の PowerShell でも env の `Library/bin` が PATH に
+  無ければ落ちる。
+
+### 正しい実行方法
+
+**PowerShell から (ユーザの通常運用)**:
+```powershell
+conda activate las2veg
+cd C:\Users\kurag\Documents\GitHub\las2veg-rgb
+python scripts/phase1_preview.py --input data/input/kamiide --crs EPSG:6676 --mesh-size 1
+```
+`conda activate` が PATH に env の `Library/bin` を前置するので問題なく動く。
+
+**エージェントが Bash 経由で動かす場合 (PATH 前置必須)**:
+```bash
+ENV="/c/Users/kurag/AppData/Local/anaconda3/envs/las2veg"
+PATH="$ENV/Library/bin:$ENV:$PATH" "$ENV/python.exe" scripts/phase1_preview.py ...
+```
+
+**エージェントが PowerShell ツール経由で動かす場合**:
+```powershell
+$ENV_ROOT = "C:\Users\kurag\AppData\Local\anaconda3\envs\las2veg"
+$env:Path = "$ENV_ROOT;$ENV_ROOT\Library\bin;$ENV_ROOT\Scripts;" + $env:Path
+& "$ENV_ROOT\python.exe" scripts/phase1_preview.py ...
+```
+
+### 描画スクリプト側の保険
+
+念のため Agg backend 強制も入れておく (GUI backend を回避するため):
 
 ```python
 import matplotlib
@@ -51,22 +85,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 ```
 
-または PowerShell から実行する。PowerShell では再現しない。
-
-### 推奨: PowerShell で実行する
-
-```powershell
-conda activate las2veg
-cd C:\Users\kurag\Documents\GitHub\las2veg-rgb
-python scripts/phase1_preview.py --input data/input/kamiide --crs EPSG:6676 --mesh-size 1
-```
-
-エージェントが Bash 経由で動かす場合は env の python.exe を絶対パスで叩く:
-
-```bash
-PY="/c/Users/kurag/AppData/Local/anaconda3/envs/las2veg/python.exe"
-"$PY" scripts/phase1_preview.py --input data/input/kamiide --crs EPSG:6676
-```
+これは GUI backend (Tk/Qt) の初期化失敗を避けるためで、PATH 問題の根治策ではない。
+両方やる。
 
 ## 2. データレイアウト
 
