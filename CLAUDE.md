@@ -84,6 +84,17 @@ PY="/c/Users/kurag/AppData/Local/anaconda3/envs/las2veg/python.exe"
   建物・植生分類は SMRF + HAG_NN で自前で行う必要がある。
 - **マルチリターンによる建物判定は針葉樹林 (杉・檜) で 22% 偽陽性**。実装したが棄却済み。
   再挑戦しないこと。判定したいなら別の特徴量 (例: 平面性、点群密度パターン) を検討。
+- **Intensity dropout 法による水系判別は kamiide では効果薄 (2026-05-24 検証)**。
+  `scripts/water_intensity_dropout.py` として独立スクリプトを保持しているが、
+  kamiide 25 タイルに**大きな水系が無く**有効性を判定できなかった。手法自体は標準的
+  (LiDAR の近赤外が水で吸収/鏡面反射 → 低 Intensity & dropout) で、湖沼や大河川を
+  含むエリアでは有効と期待される。再検証時の前提:
+  - 既存の `*_hag.laz` キャッシュ (Intensity 引き継ぎ済み) を使う
+  - 集計結果は `.npz` キャッシュで保存できるので、閾値調整は高速 (--cache オプション)
+  - z0 層 (HAG < 0.25m) の点のみで Intensity を集計
+  - 細い水系 (幅 1-3m) では SMRF が水面を地面と認識して点が残るケースあり、不向き
+  - 閾値の現在値: density<2 pts/m², P10<200, mean<500
+  別エリアで湖沼が支配的なテレインを処理する際は本スクリプトを再利用すること。
 - **canopy_height_p95 は scipy で計算 (PDAL writers.gdal max ではない)**。検証済み
   (avg max-P95=+2.2m、最大外れ値 +20m)。P95 で十分な外れ値耐性がある。
 - **density は集約 (1m → 2.5m など) で精度劣化が大きい** (r=0.88-0.95)。
