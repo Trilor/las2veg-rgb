@@ -4,16 +4,14 @@ Pipeline:
     LAS -> PDAL (drop noise, SMRF ground classify, HAG) -> cached LAZ
         -> laspy read
         -> per-layer point counts (z0/z1/z2/z3)
-        -> 7 ratio indicators:
+        -> 6 ratio indicators:
             density_z1        = z1 / (z0 + z1)
             density_z2        = z2 / (z0 + z1 + z2)
             density_z3        = z3 / total
             occupancy_z1      = subvoxel-occupied / 48
             occupancy_z2      = subvoxel-occupied / 64
-            occupancy_z3      = subvoxel-occupied / (16 * ceil((p95-2.0)/0.25))
-                                (per-cell denominator; 0.0 where p95 < 2.0)
             canopy_height_p95 = percentile(HAG, 95) within z3 / 100m
-        -> PNG previews + 7-band float32 GeoTIFF + metadata JSON
+        -> PNG previews + 6-band float32 GeoTIFF + metadata JSON
 
 All ratios are laser-density independent and live in [0.0, 1.0].
 canopy_height_p95 follows the NASA GEDI / ALS convention (RH95) for
@@ -38,10 +36,7 @@ from pathlib import Path
 
 import click
 import laspy
-import matplotlib
-
-matplotlib.use("Agg")  # Bash 経由起動時の GUI backend クラッシュ回避 (CLAUDE.md 参照)
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 from rasterio.crs import CRS
@@ -399,19 +394,10 @@ def occupancy_from_subvoxel_set(
 def canopy_p95_from_z3(
     z3_x: np.ndarray, z3_y: np.ndarray, z3_h: np.ndarray,
     gx_min: int, gy_min: int, nx: int, ny: int, mesh_size_m: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute canopy P95 height per cell.
-
-    Returns
-    -------
-    p95_m : (ny, nx) float32, P95 height in meters (raw, not normalized).
-            Cells with no z3 points are 0.0.
-    p95_norm : (ny, nx) float32, P95 normalized by CANOPY_UPPER_BOUND_M (for spec
-               output / phase 2 packing).
-    """
+) -> np.ndarray:
+    """Compute (ny, nx) float32 P95 canopy height normalized by CANOPY_UPPER_BOUND_M."""
     if z3_x.size == 0:
-        zero = np.zeros((ny, nx), dtype=np.float32)
-        return zero, zero.copy()
+        return np.zeros((ny, nx), dtype=np.float32)
     x_edges = np.linspace(gx_min, gx_min + nx * mesh_size_m, nx + 1, dtype=np.float64)
     y_edges = np.linspace(gy_min, gy_min + ny * mesh_size_m, ny + 1, dtype=np.float64)
     stat, _, _, _ = binned_statistic_2d(
@@ -420,99 +406,8 @@ def canopy_p95_from_z3(
         bins=[x_edges, y_edges],
     )
     stat = np.nan_to_num(stat, nan=0.0)
-    # stat shape は (nx, ny) で row=x。density と同じ向き (row 0 = 北) に揃える。
-    p95_m = np.flipud(stat.T).astype(np.float32)
-    p95_norm = (p95_m / CANOPY_UPPER_BOUND_M).astype(np.float32)
-    return p95_m, p95_norm
-
-
-def occupancy_z3_from_z3_points(
-    z3_x: np.ndarray, z3_y: np.ndarray, z3_h: np.ndarray,
-    canopy_p95_m: np.ndarray,
-    gx_min: int, gy_min: int, nx: int, ny: int, mesh_size_m: float,
-) -> np.ndarray:
-    """Compute (ny, nx) float32 occupancy_z3.
-
-    各セルで [2.0m, canopy_p95) を 0.25m 立方体に分割し、1点以上含むサブボクセル
-    の比率を返す。canopy_p95 < 2.0m のセルは 0.0 (キャノピー無しデータなし相当)。
-
-    占有計算は z3 点 (2.0m <= hag < 100m) のみを使う。canopy_p95_m は
-    canopy_p95_from_z3 で出した P95 の m 値で、density と同じ向き (row 0 = 北)。
-    """
-    if z3_x.size == 0:
-        return np.zeros((ny, nx), dtype=np.float32)
-
-    subs = subvoxels_per_grid(mesh_size_m)
-
-    # 全セル中の最大 P95 から bool 配列の z 軸サイズを決める。
-    # nz_sub = ceil((max_p95 - 2.0) / 0.25)。max_p95 < 2.0 の場合は 0 → 全 0 で返す。
-    max_p95 = float(canopy_p95_m.max())
-    if max_p95 < LAYERS[3].z_min + VOXEL_SIZE_M:  # < 2.25m: サブボクセル 1 個も入らない
-        return np.zeros((ny, nx), dtype=np.float32)
-    nz_sub_max = int(math.ceil((max_p95 - LAYERS[3].z_min) / VOXEL_SIZE_M))
-
-    log.info(
-        "  occupancy_z3: max p95 = %.2fm, nz_sub_max = %d "
-        "(bool buffer: %.2f GB)",
-        max_p95, nz_sub_max,
-        (ny * subs) * (nx * subs) * nz_sub_max / 8 / 1e9,
-    )
-
-    sub_x_edges = np.linspace(gx_min, gx_min + nx * mesh_size_m, nx * subs + 1, dtype=np.float64)
-    sub_y_edges = np.linspace(gy_min, gy_min + ny * mesh_size_m, ny * subs + 1, dtype=np.float64)
-    sub_z_edges = np.linspace(
-        LAYERS[3].z_min,
-        LAYERS[3].z_min + nz_sub_max * VOXEL_SIZE_M,
-        nz_sub_max + 1,
-        dtype=np.float64,
-    )
-
-    ix = np.digitize(z3_x, sub_x_edges) - 1
-    iy = np.digitize(z3_y, sub_y_edges) - 1
-    iz = np.digitize(z3_h, sub_z_edges) - 1
-    in_range = (
-        (ix >= 0) & (ix < nx * subs)
-        & (iy >= 0) & (iy < ny * subs)
-        & (iz >= 0) & (iz < nz_sub_max)
-    )
-    ix = ix[in_range]
-    iy = iy[in_range]
-    iz = iz[in_range]
-
-    subvoxel_set = np.zeros((ny * subs, nx * subs, nz_sub_max), dtype=bool)
-    subvoxel_set[iy, ix, iz] = True
-
-    # ── セル単位でサブボクセルを集計 ──
-    # occupied[ny, nx, nz_sub_max]: 各セル × 各 z サブボクセルでの占有数
-    # (1 セルに subs*subs 個の xy サブボクセルがあり、それを sum)
-    occupied = subvoxel_set.reshape(
-        ny, subs, nx, subs, nz_sub_max
-    ).sum(axis=(1, 3))  # → (ny, nx, nz_sub_max)
-    # density と同じ向き (row 0 = 北) に揃える
-    occupied = np.flipud(occupied)
-
-    # ── セルごとに p95 で上端をマスク ──
-    # 各セルで使う z サブボクセル数: nz_sub_cell = ceil((p95 - 2.0) / 0.25), clip(0, nz_sub_max)
-    nz_sub_cell = np.ceil(
-        (canopy_p95_m - LAYERS[3].z_min) / VOXEL_SIZE_M
-    ).astype(np.int32)
-    nz_sub_cell = np.clip(nz_sub_cell, 0, nz_sub_max)
-
-    # 各セルで「最初の nz_sub_cell 個のサブボクセル」だけカウント
-    # z 軸インデックスを broadcasting でマスク化
-    z_idx = np.arange(nz_sub_max, dtype=np.int32)[None, None, :]  # (1, 1, nz_sub_max)
-    valid_z = z_idx < nz_sub_cell[:, :, None]  # (ny, nx, nz_sub_max) bool
-    occupied_masked_count = np.where(valid_z, occupied, 0).sum(axis=2)  # (ny, nx)
-
-    # 分母: subs * subs * nz_sub_cell  (セルごとに可変)
-    total_sub = (subs * subs * nz_sub_cell).astype(np.float32)
-    occupancy = np.zeros((ny, nx), dtype=np.float32)
-    np.divide(
-        occupied_masked_count.astype(np.float32), total_sub,
-        out=occupancy, where=(total_sub > 0),
-    )
-    # p95 < 2.0m (nz_sub_cell == 0) のセルは上の where で 0 のまま → 仕様通り
-    return occupancy
+    normalized = (stat / CANOPY_UPPER_BOUND_M).astype(np.float32)
+    return np.flipud(normalized.T)
 
 
 def write_geotiff_indicators(
@@ -535,7 +430,6 @@ def write_geotiff_indicators(
         "density_z3",
         "occupancy_z1",
         "occupancy_z2",
-        "occupancy_z3",
         "canopy_height_p95",
     ]
     transform = from_origin(gx_min, gy_max, mesh_size_m, mesh_size_m)
@@ -726,17 +620,10 @@ def main(
     del subvoxel_sets
 
     log.info("Computing canopy_height_p95 from %d z3 points...", z3_x.size)
-    canopy_p95_m, canopy_p95_norm = canopy_p95_from_z3(
+    indicators["canopy_height_p95"] = canopy_p95_from_z3(
         z3_x, z3_y, z3_h, gx_min, gy_min, nx, ny, mesh_size_m,
     )
-    indicators["canopy_height_p95"] = canopy_p95_norm
-
-    log.info("Computing occupancy_z3 (2.0m to canopy_p95, per-cell)...")
-    indicators["occupancy_z3"] = occupancy_z3_from_z3_points(
-        z3_x, z3_y, z3_h, canopy_p95_m,
-        gx_min, gy_min, nx, ny, mesh_size_m,
-    )
-    del z3_x, z3_y, z3_h, canopy_p95_m
+    del z3_x, z3_y, z3_h
 
     # データなしセルを NaN に変換 (GeoTIFF の nodata と一致)
     # これにより下流の Phase 2 / quantized_preview / 各種分析で
@@ -754,22 +641,15 @@ def main(
         "density_z3": "viridis",
         "occupancy_z1": "magma",
         "occupancy_z2": "magma",
-        "occupancy_z3": "magma",
         "canopy_height_p95": "cividis",
     }
-    # matplotlib savefig がこの環境で時々ハードクラッシュするので、PNG プレビューの
-    # 失敗で GeoTIFF 出力を巻き込まないようにする。GeoTIFF を別途 quantized_preview で
-    # 16段階 PNG 化する運用に切り替え可能。
     for name, arr in indicators.items():
-        try:
-            save_png(
-                output_dir / f"preview_{name}.png",
-                arr,
-                title=f"{name}  (range 0.0 - 1.0)  [mesh={mesh_size_m}m]",
-                cmap=cmap_for[name],
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("  [PNG fail] %s: %s", name, e)
+        save_png(
+            output_dir / f"preview_{name}.png",
+            arr,
+            title=f"{name}  (range 0.0 - 1.0)  [mesh={mesh_size_m}m]",
+            cmap=cmap_for[name],
+        )
 
     log.info("Writing 6-band float32 GeoTIFF...")
     write_geotiff_indicators(

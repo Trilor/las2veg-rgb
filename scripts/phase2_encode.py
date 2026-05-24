@@ -1,7 +1,7 @@
 """Phase 2 encoder for las2veg-rgb.
 
 Pipeline:
-    preview_indicators.tif (7-band float32, ratios in [0,1])
+    preview_indicators.tif (6-band float32, ratios in [0,1])
         -> quantize each indicator to 16 steps (linear, value*15 rounded)
         -> pack pairs of 4-bit values into 8-bit channels (high<<4 | low)
         -> 4-band RGBA uint8 GeoTIFF
@@ -45,18 +45,6 @@ INDICATOR_BANDS: tuple[str, ...] = (
     "density_z3",
     "occupancy_z1",
     "occupancy_z2",
-    "occupancy_z3",
-    "canopy_height_p95",
-)
-
-# RGBA に詰めるのは下記 6 指標のみ。occupancy_z3 は GeoTIFF/PMTiles メタデータ
-# レベルでは保持するが、4bit パッキング枠が空いていないので RGBA エンコード対象外。
-PACKED_INDICATORS: tuple[str, ...] = (
-    "density_z1",
-    "density_z2",
-    "density_z3",
-    "occupancy_z1",
-    "occupancy_z2",
     "canopy_height_p95",
 )
 
@@ -78,7 +66,6 @@ QUANTIZE_MAX: dict[str, float] = {
     "density_z3":        1.0,
     "occupancy_z1":      0.5,
     "occupancy_z2":      0.5,
-    "occupancy_z3":      0.5,
     "canopy_height_p95": 0.6,
 }
 
@@ -111,7 +98,7 @@ def unpack_4bit_pair(packed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def read_indicators(input_path: Path) -> tuple[dict[str, np.ndarray], dict]:
-    """Read a 7-band float32 GeoTIFF and return per-indicator arrays + profile."""
+    """Read a 6-band float32 GeoTIFF and return per-indicator arrays + profile."""
     with rasterio.open(input_path) as src:
         if src.count != len(INDICATOR_BANDS):
             raise click.ClickException(
@@ -170,20 +157,19 @@ def encode(indicators: dict[str, np.ndarray]) -> np.ndarray:
     rgba = np.zeros((4, height, width), dtype=np.uint8)
 
     # quantize_to_4bit が NaN を 0 に変換するので、データなし箇所は
-    # encoded 値が全て 0 になるが、Alpha=0 で透明として明示する。
-    # occupancy_z3 は RGBA 4bit 枠が無いのでこの段では使わない (GeoTIFF 段では保持)。
+    # encoded 値が全て 0 になるが、Alpha=0 で透明として明示する
     quantized = {
-        name: quantize_to_4bit(indicators[name], QUANTIZE_MAX[name])
-        for name in PACKED_INDICATORS
+        name: quantize_to_4bit(arr, QUANTIZE_MAX[name])
+        for name, arr in indicators.items()
     }
 
     for ch_idx, (high_name, low_name) in enumerate(PACKING):
         rgba[ch_idx] = pack_4bit_pair(quantized[high_name], quantized[low_name])
 
-    # データなしマスクを作成: RGBA に詰める指標のいずれかが NaN ならデータなし
+    # データなしマスクを作成: いずれかの指標が NaN ならデータなし
     nodata = np.zeros((height, width), dtype=bool)
-    for name in PACKED_INDICATORS:
-        nodata |= np.isnan(indicators[name])
+    for arr in indicators.values():
+        nodata |= np.isnan(arr)
     rgba[3] = np.where(nodata, 0, 255).astype(np.uint8)
     return rgba
 
@@ -204,8 +190,7 @@ def verify_roundtrip(
         decoded[low_name]  = (low4.astype(np.float32) + 0.5) / 16.0 * QUANTIZE_MAX[low_name]
 
     stats: dict[str, dict[str, float]] = {}
-    # round-trip 検証は RGBA に詰めた指標のみが対象 (occupancy_z3 は未パッキング)
-    for name in PACKED_INDICATORS:
+    for name in INDICATOR_BANDS:
         # NaN (データなし) セルは round-trip 検証から除外
         original = indicators[name]
         valid = ~np.isnan(original)

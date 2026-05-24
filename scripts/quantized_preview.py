@@ -18,13 +18,10 @@ import sys
 from pathlib import Path
 
 import click
-import matplotlib
-
-matplotlib.use("Agg")  # Bash 経由起動時の GUI backend クラッシュ回避
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-import rasterio  # noqa: E402
-from matplotlib.colors import BoundaryNorm, ListedColormap  # noqa: E402
+import matplotlib.pyplot as plt
+import numpy as np
+import rasterio
+from matplotlib.colors import BoundaryNorm, ListedColormap
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -43,7 +40,6 @@ QUANTIZE_MAX: dict[str, float] = {
     "density_z3":        1.0,
     "occupancy_z1":      0.5,
     "occupancy_z2":      0.5,
-    "occupancy_z3":      0.5,
     "canopy_height_p95": 0.6,
 }
 
@@ -54,7 +50,6 @@ INDICATOR_NAMES: tuple[str, ...] = (
     "density_z3",
     "occupancy_z1",
     "occupancy_z2",
-    "occupancy_z3",
     "canopy_height_p95",
 )
 
